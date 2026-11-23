@@ -1,0 +1,259 @@
+#!/usr/bin/env bash
+# portwatch — daftar port yang listening beserta nama proses dan user-nya.
+#
+# Membaca socket listening lewat `ss` (utama) atau `lsof` (fallback),
+# lalu menampilkan tabel rapi: PROTO, alamat lokal, port, state, PID,
+# nama proses, dan user pemilik proses.
+#
+# Contoh:
+#   portwatch                 # semua port listening (TCP + UDP)
+#   portwatch --tcp           # hanya TCP
+#   portwatch --port 22       # hanya port 22
+#   portwatch --process nginx # hanya proses yang namanya mengandung "nginx"
+#   portwatch --json          # output JSON
+#   portwatch --watch 5       # refresh tiap 5 detik sampai Ctrl-C
+#
+# Catatan: info proses (nama/PID) hanya terlihat untuk proses milik user
+# yang sama, kecuali dijalankan sebagai root. Port < 1024 yang dibuka
+# proses user lain akan tampil dengan PROCESS/USER "-".
+set -euo pipefail
+
+VERSION="1.0.0"
+
+PROTO_FILTER="all"   # tcp | udp | all
+PORT_FILTER=""
+PROC_FILTER=""
+USER_FILTER=""
+SORT_KEY="port"      # port | process | user
+JSON_OUT=0
+WATCH_SEC=0
+NO_HEADER=0
+
+usage() {
+    cat <<'EOF'
+Usage: portwatch [OPTIONS]
+
+List listening ports with process name and owner.
+
+Options:
+  --tcp               Show TCP listeners only
+  --udp               Show UDP listeners only
+  --port N            Show only port N
+  --process NAME      Show only processes whose name contains NAME
+  --user USER         Show only processes owned by USER
+  --sort KEY          Sort by: port (default), process, user
+  --json              Output JSON instead of a table
+  --watch SECONDS     Refresh every SECONDS (Ctrl-C to stop)
+  --no-header         Omit the table header
+  --version           Print version and exit
+  -h, --help          Show this help and exit
+EOF
+}
+
+die() {
+    printf 'portwatch: %s\n' "$*" >&2
+    exit 1
+}
+
+# json_escape STR — escape backslash dan kutip ganda untuk output JSON.
+json_escape() {
+    local s="$1"
+    s=${s//\\/\\\\}
+    s=${s//\"/\\\"}
+    s=${s//$'\t'/\\t}
+    printf '%s' "$s"
+}
+
+# user_of_pid PID — nama user pemilik PID, atau "-" kalau tidak diketahui.
+user_of_pid() {
+    local pid="$1" user=""
+    if [[ -n "$pid" && "$pid" != "-" ]]; then
+        user=$(ps -o user= -p "$pid" 2>/dev/null | tr -d '[:space:]' || true)
+    fi
+    [[ -n "$user" ]] && printf '%s' "$user" || printf '%s' "-"
+}
+
+# row_matches PROTO PORT PROC USER — 0 kalau baris lolos semua filter.
+row_matches() {
+    local proto="$1" port="$2" proc="$3" user="$4"
+    case "$PROTO_FILTER" in
+        tcp) [[ "$proto" == "tcp" ]] || return 1 ;;
+        udp) [[ "$proto" == "udp" ]] || return 1 ;;
+    esac
+    [[ -n "$PORT_FILTER" ]] && [[ "$port" != "$PORT_FILTER" ]] && return 1
+    if [[ -n "$PROC_FILTER" ]]; then
+        [[ "${proc,,}" == *"${PROC_FILTER,,}"* ]] || return 1
+    fi
+    if [[ -n "$USER_FILTER" ]]; then
+        [[ "$user" == "$USER_FILTER" ]] || return 1
+    fi
+    return 0
+}
+
+# emit_row PROTO ADDR PORT STATE PID PROC USER — cetak satu baris TSV
+# (kolom: proto, addr, port, state, pid, proc, user) kalau lolos filter.
+emit_row() {
+    local proto="$1" addr="$2" port="$3" state="$4" pid="$5" proc="$6" user="$7"
+    row_matches "$proto" "$port" "$proc" "$user" || return 0
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$proto" "$addr" "$port" "$state" "$pid" "$proc" "$user"
+}
+
+# collect_via_ss — baca listener dari `ss -tulnp`.
+collect_via_ss() {
+    local line proto state local_addr proc_field addr port proc pid user
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        proto=$(awk '{print $1}' <<<"$line")
+        state=$(awk '{print $2}' <<<"$line")
+        local_addr=$(awk '{print $5}' <<<"$line")
+        proc_field=$(awk '{print $7}' <<<"$line")
+        [[ -z "$local_addr" ]] && continue
+        port=${local_addr##*:}
+        addr=${local_addr%:*}
+        [[ "$port" =~ ^[0-9]+$ ]] || continue
+        proc="-"; pid="-"
+        if [[ "$proc_field" == users:* ]]; then
+            proc=$(sed -n 's/.*users:(("\([^"]*\)".*/\1/p' <<<"$proc_field")
+            pid=$(sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' <<<"$proc_field")
+            [[ -n "$proc" ]] || proc="-"
+            [[ -n "$pid" ]] || pid="-"
+        fi
+        user=$(user_of_pid "$pid")
+        emit_row "$proto" "$addr" "$port" "$state" "$pid" "$proc" "$user"
+    done < <(ss -tulnp 2>/dev/null | tail -n +2)
+}
+
+# collect_via_lsof — fallback kalau `ss` tidak tersedia.
+# Format baris lsof: COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME
+collect_via_lsof() {
+    local line cmd pid user name addr port proto state
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        cmd=$(awk '{print $1}' <<<"$line")
+        pid=$(awk '{print $2}' <<<"$line")
+        user=$(awk '{print $3}' <<<"$line")
+        name=$(awk '{print $9}' <<<"$line")
+        [[ -z "$name" ]] && continue
+        if [[ "$name" == *"(LISTEN)"* ]]; then
+            proto="tcp"; state="LISTEN"
+        elif [[ "$line" == *" UDP "* ]]; then
+            proto="udp"; state="UNCONN"
+        else
+            continue
+        fi
+        addr=${name%:*}
+        port=${name##*:}
+        [[ "$port" =~ ^[0-9]+$ ]] || continue
+        emit_row "$proto" "$addr" "$port" "$state" "$pid" "$cmd" "$user"
+    done < <(lsof -i -P -n -sTCP:LISTEN 2>/dev/null; lsof -iUDP -P -n 2>/dev/null | tail -n +2)
+}
+
+# collect_rows — kumpulkan semua baris TSV, lalu urutkan.
+collect_rows() {
+    local rows=""
+    if command -v ss >/dev/null 2>&1; then
+        rows=$(collect_via_ss)
+    elif command -v lsof >/dev/null 2>&1; then
+        rows=$(collect_via_lsof)
+    else
+        die "butuh 'ss' atau 'lsof' — keduanya tidak ditemukan di PATH"
+    fi
+    [[ -z "$rows" ]] && return 0
+    case "$SORT_KEY" in
+        port)    printf '%s\n' "$rows" | LC_ALL=C sort -t $'\t' -k3,3n -k1,1 ;;
+        process) printf '%s\n' "$rows" | LC_ALL=C sort -t $'\t' -k6,6 -k3,3n ;;
+        user)    printf '%s\n' "$rows" | LC_ALL=C sort -t $'\t' -k7,7 -k3,3n ;;
+    esac
+}
+
+# print_table ROWS — format TSV jadi tabel rata kolom (tanpa `column`).
+print_table() {
+    local rows="$1"
+    if [[ -z "$rows" ]]; then
+        printf 'No listening ports found.\n'
+        return 0
+    fi
+    if [[ "$NO_HEADER" -eq 0 ]]; then
+        rows=$(printf 'PROTO\tLOCAL ADDRESS\tPORT\tSTATE\tPID\tPROCESS\tUSER\n%s' "$rows")
+    fi
+    awk -F'\t' '
+        { for (i = 1; i <= NF; i++) if (length($i) > w[i]) w[i] = length($i) }
+        { lines[NR] = $0; nfields = NF }
+        END {
+            for (r = 1; r <= NR; r++) {
+                split(lines[r], f, "\t")
+                for (i = 1; i <= nfields; i++) {
+                    if (i < nfields) printf "%-*s  ", w[i], f[i]
+                    else printf "%s", f[i]
+                }
+                printf "\n"
+            }
+        }' <<<"$rows"
+}
+
+# print_json ROWS — format TSV jadi array JSON.
+print_json() {
+    local rows="$1" first=1 line proto addr port state pid proc user
+    printf '[\n'
+    while IFS=$'\t' read -r proto addr port state pid proc user; do
+        [[ -z "$proto" ]] && continue
+        [[ "$first" -eq 0 ]] && printf ',\n'
+        first=0
+        printf '  {"proto": "%s", "address": "%s", "port": %s, "state": "%s", ' \
+            "$(json_escape "$proto")" "$(json_escape "$addr")" "$port" "$(json_escape "$state")"
+        if [[ "$pid" == "-" ]]; then printf '"pid": null, '; else printf '"pid": %s, ' "$pid"; fi
+        printf '"process": "%s", "user": "%s"}' \
+            "$(json_escape "$proc")" "$(json_escape "$user")"
+    done <<<"$rows"
+    printf '\n]\n'
+}
+
+print_once() {
+    local rows
+    rows=$(collect_rows)
+    if [[ "$JSON_OUT" -eq 1 ]]; then
+        print_json "$rows"
+    else
+        print_table "$rows"
+    fi
+}
+
+# --- parse argumen -------------------------------------------------------
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --tcp)       PROTO_FILTER="tcp" ;;
+        --udp)       PROTO_FILTER="udp" ;;
+        --port)      shift; [[ $# -gt 0 ]] || die "--port butuh nilai"; PORT_FILTER="$1"
+                     [[ "$PORT_FILTER" =~ ^[0-9]+$ ]] || die "--port harus angka" ;;
+        --process)   shift; [[ $# -gt 0 ]] || die "--process butuh nilai"; PROC_FILTER="$1" ;;
+        --user)      shift; [[ $# -gt 0 ]] || die "--user butuh nilai"; USER_FILTER="$1" ;;
+        --sort)      shift; [[ $# -gt 0 ]] || die "--sort butuh nilai"
+                     case "$1" in
+                         port|process|user) SORT_KEY="$1" ;;
+                         *) die "--sort harus: port, process, atau user" ;;
+                     esac ;;
+        --json)      JSON_OUT=1 ;;
+        --watch)     shift; [[ $# -gt 0 ]] || die "--watch butuh nilai (detik)"
+                     [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -gt 0 ]] || die "--watch harus angka > 0"
+                     WATCH_SEC="$1" ;;
+        --no-header) NO_HEADER=1 ;;
+        --version)   printf 'portwatch %s\n' "$VERSION"; exit 0 ;;
+        -h|--help)   usage; exit 0 ;;
+        *)           die "opsi tidak dikenal: $1 (coba --help)" ;;
+    esac
+    shift
+done
+
+if [[ "$WATCH_SEC" -gt 0 ]]; then
+    trap 'printf "\n"; exit 0' INT TERM
+    while true; do
+        clear
+        printf 'portwatch — %s (refresh tiap %ss, Ctrl-C untuk berhenti)\n\n' \
+            "$(date '+%Y-%m-%d %H:%M:%S')" "$WATCH_SEC"
+        print_once
+        sleep "$WATCH_SEC"
+    done
+else
+    print_once
+fi
